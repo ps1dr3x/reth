@@ -69,7 +69,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
     ) -> impl Future<Output = SimulatedBlocksResult<Self::NetworkTypes, Self::Error>> + Send {
         async move {
             if payload.block_state_calls.len() > self.max_simulate_blocks() as usize {
-                return Err(EthApiError::InvalidParams("too many blocks.".to_string()).into())
+                return Err(EthApiError::InvalidParams("too many blocks.".to_string()).into());
             }
 
             let block = block.unwrap_or_default();
@@ -82,7 +82,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             } = payload;
 
             if block_state_calls.is_empty() {
-                return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into())
+                return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into());
             }
 
             let base_block =
@@ -221,9 +221,48 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         overrides: EvmOverrides,
     ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send {
         async move {
+            // Track end-to-end time spent in eth_call, including waiting for the blocking-IO
+            // semaphore permit. This helps identify starvation / backpressure scenarios under load.
+            let overall_start = std::time::Instant::now();
+
+            let permit_wait_start = std::time::Instant::now();
             let _permit = self.acquire_owned_blocking_io().await;
-            let res =
-                self.transact_call_at(request, block_number.unwrap_or_default(), overrides).await?;
+            let permit_wait = permit_wait_start.elapsed();
+
+            // Offload the full eth_call execution to the blocking IO pool so we don't risk
+            // starving tokio runtime workers with synchronous DB reads or long-running EVM work.
+            let at = block_number.unwrap_or_default();
+            let exec_start = std::time::Instant::now();
+            let res = self
+                .spawn_blocking_io_fut(move |this| async move {
+                    let (evm_env, at) = this.evm_env_at(at).await?;
+                    let state = this.state_at_block_id(at).await?;
+                    let mut db = State::builder()
+                        .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
+                            state,
+                        )))
+                        .build();
+                    let (evm_env, tx_env) =
+                        this.prepare_call_env(evm_env, request, &mut db, overrides)?;
+                    this.transact(&mut db, evm_env, tx_env)
+                })
+                .await?;
+            let exec_time = exec_start.elapsed();
+
+            let overall = overall_start.elapsed();
+
+            // Warn on slow calls to help correlate "open transaction too long" logs with actual
+            // caller behavior and time spent waiting vs executing.
+            if overall.as_millis() >= 1_000 {
+                warn!(
+                    target: "reth::rpc::eth_call",
+                    ?at,
+                    permit_wait_ms = permit_wait.as_millis(),
+                    exec_ms = exec_time.as_millis(),
+                    total_ms = overall.as_millis(),
+                    "slow eth_call"
+                );
+            }
 
             Self::Error::ensure_success(res.result)
         }
@@ -559,7 +598,7 @@ pub trait Call:
                 .spawn_with_call_at(request, at, overrides, move |db, evm_env, tx_env| {
                     if cancel.is_cancelled() {
                         // callsite dropped the guard
-                        return Err(EthApiError::InternalEthError.into())
+                        return Err(EthApiError::InternalEthError.into());
                     }
                     this.transact(db, evm_env, tx_env)
                 })
@@ -711,7 +750,7 @@ pub trait Call:
         for tx in transactions {
             if *tx.tx_hash() == target_tx_hash {
                 // reached the target transaction
-                break
+                break;
             }
 
             let tx_env = self.evm_config().tx_env(tx);
